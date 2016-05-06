@@ -1,3 +1,4 @@
+import librosa
 import numpy as np
 from params import *
 from multiprocessing import Process, Queue, JoinableQueue, Value
@@ -8,116 +9,133 @@ import socket
 
 
 class ParallelBatchIterator(object):
-	"""
-	Uses a producer-consumer model to prepare batches on the CPU while training on the GPU.
-	"""
+    """
+    Uses a producer-consumer model to prepare batches on the CPU while training on the GPU.
+    """
 
-	def __init__(self, X, y, batch_size, dataset):
-		self.batch_size = batch_size
-		self.X = X
-		self.y = y
-		self.dataset = dataset
+    def __init__(self, X, y, batch_size, dataset, n_components, mfcc):
+        self.batch_size = batch_size
+        self.X = X
+        self.y = y
+        self.dataset = dataset
+        self.n_components = n_components
+        self.mfcc = mfcc
 
-	def chunks(self, l, n):
-		""" Yield successive n-sized chunks from l.
-			from http://goo.gl/DZNhk
-		"""
-		for i in xrange(0, len(l), n):
-			yield l[i:i + n]
+    def chunks(self, l, n):
+        """ Yield successive n-sized chunks from l.
+            from http://goo.gl/DZNhk
+        """
+        for i in xrange(0, len(l), n):
+            yield l[i:i + n]
 
-	def read_data(self, filename):
-		with open(filename, 'rb') as f:
-			data = np.fromfile(f, dtype='>i2')
+    def read_data(self, filename):
+        with open(filename, 'rb') as f:
+            data = np.fromfile(f, dtype='>i2')
 
-		return data / (0.001 + np.max(np.abs(data)))
+        #TODO: different normalization?
+        return data / (0.001 + np.max(np.abs(data)))
 
-	def process(self, key_x, key_y):
-		# Read X
-		x = self.read_data('F:/Temp/aurora2/' + self.dataset + '/' + key_x)
-		
-		# Read Y
-		y = self.read_data('F:/Temp/aurora2/' + self.dataset + '/' + key_y)
+    def process(self, key_x, key_y, path='aurora2/'):
+        # Read X
+        x = self.read_data(path + self.dataset + '/' + key_x)
 
-		return x, y
+        # Read Y
+        y = self.read_data(path + self.dataset + '/' + key_y)
 
-	def gen(self, indices):
-		key_batch_x = [self.X[ix] for ix in indices]
-		key_batch_y = [self.y[ix] for ix in indices]
+        return x, y
 
-		cur_batch_size = len(indices)
+    def gen(self, indices):
+        key_batch_x = [self.X[ix] for ix in indices]
+        key_batch_y = [self.y[ix] for ix in indices]
 
-		X_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
-		y_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
+        cur_batch_size = len(indices)
 
-		# Read all images in the batch
-		for i in range(len(key_batch_x)):
-			X_batch[i], y_batch[i] = self.process(key_batch_x[i], key_batch_y[i])
+        X_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
+        y_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
 
-		# Transform the batch (augmentation, fft, normalization, etc.)
-		X_batch, y_batch = self.transform(X_batch, y_batch)
+        # Read all images in the batch
+        for i in range(len(key_batch_x)):
+            #TODO: find MAX_LENGTH
+            X, y = self.process(key_batch_x[i], key_batch_y[i])
+            X_batch[i, :X.shape[0]], y_batch[i, :y.shape[0]] = X[:X_batch.shape[1]], y[:y_batch.shape[1]]
 
-		return X_batch, y_batch
+        # Transform the batch (augmentation, fft, normalization, etc.)
+        # TODO: check sampling rate of loaded files
+        X_batch_new, y_batch_new = self.transform(X_batch, y_batch, sr=44100)
 
-	def __iter__(self):
-		queue = JoinableQueue(maxsize=params.N_PRODUCERS * 8)
+        return X_batch_new, y_batch_new
 
-		n_batches, job_queue = self.start_producers(queue)
+    def __iter__(self):
+        queue = JoinableQueue(maxsize=params.N_PRODUCERS * 8)
 
-		# Run as consumer (read items from queue, in current thread)
-		for x in xrange(n_batches):
-			item = queue.get()
-			yield item
-			queue.task_done()
+        n_batches, job_queue = self.start_producers(queue)
 
-		queue.close()
-		job_queue.close()
+        # Run as consumer (read items from queue, in current thread)
+        for x in xrange(n_batches):
+            item = queue.get()
+            yield item
+            queue.task_done()
 
-	def start_producers(self, result_queue):
-		jobs = Queue()
-		n_workers = params.N_PRODUCERS
-		batch_count = 0
+        queue.close()
+        job_queue.close()
 
-		# Flag used for keeping values in queue in order
-		last_queued_job = Value('i', -1)
+    def start_producers(self, result_queue):
+        jobs = Queue()
+        n_workers = params.N_PRODUCERS
+        batch_count = 0
 
-		for job_index, batch in enumerate(self.chunks(range(0, len(self.X)), self.batch_size)):
-			batch_count += 1
-			jobs.put((job_index, batch))
+        # Flag used for keeping values in queue in order
+        last_queued_job = Value('i', -1)
 
-		# Define producer (putting items into queue)
-		def produce(id):
-			while True:
-				job_index, task = jobs.get()
+        for job_index, batch in enumerate(self.chunks(range(0, len(self.X)), self.batch_size)):
+            batch_count += 1
+            jobs.put((job_index, batch))
 
-				if task is None:
-					break
+        # Define producer (putting items into queue)
+        def produce(id):
+            while True:
+                job_index, task = jobs.get()
 
-				result = self.gen(task)
+                if task is None:
+                    break
 
-				while(True):
-					# My turn to add job done
-					if last_queued_job.value == job_index - 1:
-						with last_queued_job.get_lock():
-							result_queue.put(result)
-							last_queued_job.value += 1
-							break
+                result = self.gen(task)
 
-		# Start workers
-		for i in xrange(n_workers):
-			if params.MULTIPROCESS:
-				p = Process(target=produce, args=(i,))
-			else:
-				p = Thread(target=produce, args=(i,))
+                while(True):
+                    # My turn to add job done
+                    if last_queued_job.value == job_index - 1:
+                        with last_queued_job.get_lock():
+                            result_queue.put(result)
+                            last_queued_job.value += 1
+                            break
 
-			p.daemon = True
-			p.start()
+        # Start workers
+        for i in xrange(n_workers):
+            if params.MULTIPROCESS:
+                p = Process(target=produce, args=(i,))
+            else:
+                p = Thread(target=produce, args=(i,))
 
-		# Add poison pills to queue (to signal workers to stop)
-		for i in xrange(n_workers):
-			jobs.put((-1, None))
+            p.daemon = True
+            p.start()
 
-		return batch_count, jobs
+        # Add poison pills to queue (to signal workers to stop)
+        for i in xrange(n_workers):
+            jobs.put((-1, None))
 
-	def transform(self, Xb, yb):
-		# Do fft or something
-		return Xb, yb
+        return batch_count, jobs
+
+    def transform(self, Xb, yb, sr):
+        Xb_new = np.zeros((Xb.shape[0], self.n_components, Xb.shape[1]/500), dtype=theano.config.floatX)
+        yb_new = np.zeros_like(Xb_new)
+        #TODO: preprocess and load instead of transforming each time.
+        for i in range(Xb.shape[0]):
+            if self.mfcc:
+                Xb_new[i] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=self.n_components, S=None)
+                yb_new[i] = librosa.feature.mfcc(yb[i], sr, n_mfcc=self.n_components, S=None)
+            else:
+                Xb_new[i] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)
+                yb_new[i] = librosa.feature.melspectrogram(yb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)
+            Xb_new[i] /= np.max(Xb_new[i])+1.e-12
+            yb_new[i] /= np.max(yb_new[i])+1.e-12
+        return Xb_new, yb_new
