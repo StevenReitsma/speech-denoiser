@@ -79,13 +79,13 @@ class NeuralNetwork():
         self.learning_rate = par.START_LEARNING_RATE
         self.batch_size = batch_size
         self.n_batches = ceil(len(X_train) / float(batch_size))
-        self.n_val_batches = ceil(len(X_valid) / float(batch_size*10))
+        self.n_val_batches = ceil(len(X_valid) / float(batch_size))
 
         self.n_components = 128
         self.mfcc = False
 
         self.batch_iterator_train = ParallelBatchIterator(X_train, y_train, batch_size, 'train', self.n_components, self.mfcc)
-        self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size*10, 'train', self.n_components, self.mfcc)
+        self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size, 'train', self.n_components, self.mfcc)
 
         self.logger = PrintLog()
         self.create_iterator_functions()
@@ -115,7 +115,7 @@ class NeuralNetwork():
 
         # Compile functions
         self.train_fn = theano.function([input_var, target_var], loss, updates=updates)
-        self.val_fn = theano.function([input_var, target_var], test_loss)
+        self.val_fn = theano.function([input_var, target_var], [test_loss, test_prediction])
 
     def fit(self):
         best_valid_loss = np.inf
@@ -132,8 +132,14 @@ class NeuralNetwork():
                 train_losses.append(loss)
 
             for Xb, yb in tqdm(self.batch_iterator_test, total=self.n_val_batches):
-                loss = self.val_fn(Xb, yb)
+                loss, prediction = self.val_fn(Xb, yb)
                 valid_losses.append(loss)
+
+            # visualize sample
+            plt.imshow(np.concatenate((Xb[0], np.ones((Xb.shape[1], 1)), yb[0], np.ones((Xb.shape[1], 1)), prediction[0]), axis=1))
+            plt.axis('off')
+            plt.title('real/target/reconstruction')
+            plt.savefig('visualizations/' + 'sample.png')
 
             avg_train_loss = np.mean(train_losses)
             avg_valid_loss = np.mean(valid_losses)
