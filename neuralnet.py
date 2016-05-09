@@ -81,8 +81,8 @@ class NeuralNetwork():
         self.n_batches = ceil(len(X_train) / float(batch_size))
         self.n_val_batches = ceil(len(X_valid) / float(batch_size))
 
-        self.n_components = 128
-        self.mfcc = False
+        self.n_components = 40
+        self.mfcc = True
 
         self.batch_iterator_train = ParallelBatchIterator(X_train, y_train, batch_size, 'train', self.n_components, self.mfcc)
         self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size, 'train', self.n_components, self.mfcc)

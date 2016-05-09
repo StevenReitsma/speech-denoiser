@@ -131,8 +131,8 @@ class ParallelBatchIterator(object):
         #TODO: preprocess and load instead of transforming each time.
         for i in range(Xb.shape[0]):
             if self.mfcc:
-                Xb_new[i] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=self.n_components, S=None)
-                yb_new[i] = librosa.feature.mfcc(yb[i], sr, n_mfcc=self.n_components, S=None)
+                Xb_new[i] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=self.n_components, n_fft=2048, hop_length=512, S=None)
+                yb_new[i] = librosa.feature.mfcc(yb[i], sr, n_mfcc=self.n_components, n_fft=2048, hop_length=512, S=None)
             else:
                 Xb_new[i] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)
                 yb_new[i] = librosa.feature.melspectrogram(yb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)

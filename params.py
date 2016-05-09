@@ -1,7 +1,7 @@
 class Params():
 	def __init__(self):
 		self.BATCH_SIZE = 128
-		self.START_LEARNING_RATE = 1
+		self.START_LEARNING_RATE = 0.01
 		self.EPOCHS = 100
 
 		self.MAX_LENGTH = 10000
