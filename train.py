@@ -8,6 +8,9 @@ def create_file_list(folder_clean):
     X = []
     for file in os.listdir('aurora2/train/' + folder_clean):
         filename_clean = folder_clean + '/' + file
+        y += [filename_clean]
+        X += [filename_clean]
+        print('adding: ', filename_clean, filename_clean)
         for i in range(4):
             for j in range(4):
                 # check if noisy version exists
@@ -25,12 +28,12 @@ if __name__ == "__main__":
                'multi/N3_SNR5/FAC_4A.08', 'multi/N4_SNR5/FAC_5A.08', 'multi/N3_SNR15/FAC_6A.08',
                'multi/N3_SNR5/FAC_7A.08', 'multi/N1_SNR10/FAC_8A.08', 'multi/N2_SNR5/FAC_9A.08']
 
-    # find all clean files, and add with all noisy files
+    # find all clean files, and add with all noisy files, INCLUDING CLEAN TO CLEAN
     folder_clean = 'clean'
     X_train, y_train = create_file_list(folder_clean)
 
-    X_train = X_train[:256]
-    y_train = y_train[:256]
+    X_train = X_train[:]
+    y_train = y_train[:]
     print('Data size: ', len(X_train))
     # TODO: Use different validation set and test set.
     X_valid = X_train

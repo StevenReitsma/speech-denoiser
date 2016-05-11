@@ -13,13 +13,11 @@ class ParallelBatchIterator(object):
     Uses a producer-consumer model to prepare batches on the CPU while training on the GPU.
     """
 
-    def __init__(self, X, y, batch_size, dataset, n_components, mfcc):
+    def __init__(self, X, y, batch_size, dataset):
         self.batch_size = batch_size
         self.X = X
         self.y = y
         self.dataset = dataset
-        self.n_components = n_components
-        self.mfcc = mfcc
 
     def chunks(self, l, n):
         """ Yield successive n-sized chunks from l.
@@ -60,8 +58,7 @@ class ParallelBatchIterator(object):
             X_batch[i, :X.shape[0]], y_batch[i, :y.shape[0]] = X[:X_batch.shape[1]], y[:y_batch.shape[1]]
 
         # Transform the batch (augmentation, fft, normalization, etc.)
-        # TODO: check sampling rate of loaded files
-        X_batch_new, y_batch_new = self.transform(X_batch, y_batch, sr=44100)
+        X_batch_new, y_batch_new = self.transform(X_batch, y_batch, sr=params.SR)
 
         return X_batch_new, y_batch_new
 
@@ -126,16 +123,26 @@ class ParallelBatchIterator(object):
         return batch_count, jobs
 
     def transform(self, Xb, yb, sr):
-        Xb_new = np.zeros((Xb.shape[0], self.n_components, Xb.shape[1]/500), dtype=theano.config.floatX)
+        n_fft = self.next_greater_power_of_2((params.WINDOW_SIZE/1000.0) * params.SR)
+        hop_length = self.next_greater_power_of_2((params.STEP_SIZE/1000.0) * params.SR)
+        Xb_new = np.zeros((Xb.shape[0], params.N_COMPONENTS, int(np.ceil(Xb.shape[1]/hop_length))+2), dtype=theano.config.floatX)
         yb_new = np.zeros_like(Xb_new)
         #TODO: preprocess and load instead of transforming each time.
         for i in range(Xb.shape[0]):
-            if self.mfcc:
-                Xb_new[i] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=self.n_components, n_fft=2048, hop_length=512, S=None)
-                yb_new[i] = librosa.feature.mfcc(yb[i], sr, n_mfcc=self.n_components, n_fft=2048, hop_length=512, S=None)
+            if params.MFCC:
+                Xb_new[i, :, :-1] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)
+                yb_new[i, :, :-1] = librosa.feature.mfcc(yb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)
             else:
-                Xb_new[i] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)
-                yb_new[i] = librosa.feature.melspectrogram(yb[i], sr, n_mels=self.n_components, n_fft=2048, hop_length=512)
+                Xb_new[i, :, :-1] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)
+                yb_new[i, :, :-1] = librosa.feature.melspectrogram(yb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)
             Xb_new[i] /= np.max(Xb_new[i])+1.e-12
             yb_new[i] /= np.max(yb_new[i])+1.e-12
         return Xb_new, yb_new
+
+
+    def pre_process(self):
+        pass
+
+    def next_greater_power_of_2(self, x):
+        return int(2**np.math.ceil(np.math.log(x, 2)))
+

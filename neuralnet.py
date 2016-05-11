@@ -1,3 +1,5 @@
+from sklearn.preprocessing import StandardScaler
+
 from iterators import ParallelBatchIterator
 import pickle
 import lasagne
@@ -9,7 +11,7 @@ from tabulate import tabulate
 from collections import OrderedDict
 import sys
 
-from model import build_model
+from model import build_model, build_model_small, build_model_dense
 from params import params as par
 from lasagne.layers import DenseLayer, NonlinearityLayer, DropoutLayer
 from lasagne.nonlinearities import softmax, linear
@@ -81,11 +83,8 @@ class NeuralNetwork():
         self.n_batches = ceil(len(X_train) / float(batch_size))
         self.n_val_batches = ceil(len(X_valid) / float(batch_size))
 
-        self.n_components = 40
-        self.mfcc = True
-
-        self.batch_iterator_train = ParallelBatchIterator(X_train, y_train, batch_size, 'train', self.n_components, self.mfcc)
-        self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size, 'train', self.n_components, self.mfcc)
+        self.batch_iterator_train = ParallelBatchIterator(X_train, y_train, batch_size, 'train')
+        self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size, 'train')
 
         self.logger = PrintLog()
         self.create_iterator_functions()
@@ -97,7 +96,8 @@ class NeuralNetwork():
         # Define input and target variables
         input_var = T.ftensor3('inputs')
         target_var = T.ftensor3('targets')
-        self.net = build_model((None, self.n_components, par.MAX_LENGTH/500), input_var)
+        hop_length = 2**np.math.ceil(np.math.log(((par.STEP_SIZE / 1000.0) * par.SR), 2))
+        self.net = build_model_small((None, par.N_COMPONENTS, int(np.ceil(par.MAX_LENGTH/hop_length))+1), input_var)
 
         # Define prediction and loss calculation
         prediction = lasagne.layers.get_output(self.net['prob'], inputs=input_var)
@@ -121,6 +121,7 @@ class NeuralNetwork():
         best_valid_loss = np.inf
         best_train_loss = np.inf
         train_history = []
+        standard_scaler = StandardScaler(copy=False)
         for epoch in range(0, self.max_epochs):
             t0 = time()
 
@@ -128,15 +129,20 @@ class NeuralNetwork():
             valid_losses = []
 
             for Xb, yb in tqdm(self.batch_iterator_train, total=self.n_batches):
+                standard_scaler.partial_fit(yb.reshape(Xb.shape[0], -1))
+                Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = standard_scaler.transform(yb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
                 loss = self.train_fn(Xb, yb)
                 train_losses.append(loss)
 
             for Xb, yb in tqdm(self.batch_iterator_test, total=self.n_val_batches):
+                Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = standard_scaler.transform(yb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
                 loss, prediction = self.val_fn(Xb, yb)
                 valid_losses.append(loss)
 
             # visualize sample
-            plt.imshow(np.concatenate((Xb[0], np.ones((Xb.shape[1], 1)), yb[0], np.ones((Xb.shape[1], 1)), prediction[0]), axis=1))
+            plt.imshow(np.concatenate((Xb[0], np.ones((Xb.shape[1], 1)), yb[0], np.ones((Xb.shape[1], 1)), prediction[0]), axis=1), aspect='auto')
             plt.axis('off')
             plt.title('real/target/reconstruction')
             plt.savefig('visualizations/' + 'sample.png')
