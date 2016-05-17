@@ -6,6 +6,7 @@ from threading import Thread
 import theano
 from time import time
 import socket
+import pickle
 
 
 class ParallelBatchIterator(object):
@@ -13,11 +14,15 @@ class ParallelBatchIterator(object):
     Uses a producer-consumer model to prepare batches on the CPU while training on the GPU.
     """
 
-    def __init__(self, X, y, batch_size, dataset):
+    def __init__(self, X, y, batch_size, dataset, shuffle=False, preprocess=False):
         self.batch_size = batch_size
         self.X = X
         self.y = y
         self.dataset = dataset
+        self.shuffle = shuffle
+        np.random.seed(0)
+        if preprocess:
+            self.pre_process()
 
     def chunks(self, l, n):
         """ Yield successive n-sized chunks from l.
@@ -42,25 +47,43 @@ class ParallelBatchIterator(object):
 
         return x, y
 
-    def gen(self, indices):
+    def process_temp(self, key_x, key_y, path='aurora2/'):
+        with open(path + self.dataset + '/' + key_x+'.npy', 'rb') as f:
+            x = np.load(f)
+        with open(path + self.dataset + '/' + key_y+'.npy', 'rb') as f:
+            y = np.load(f)
+        return x, y
+
+    def gen(self, indices, temp=True):
         key_batch_x = [self.X[ix] for ix in indices]
         key_batch_y = [self.y[ix] for ix in indices]
 
         cur_batch_size = len(indices)
 
-        X_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
-        y_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
+        if not temp:
+            X_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
+            y_batch = np.zeros((cur_batch_size, params.MAX_LENGTH), dtype=theano.config.floatX)
+        else:
+            hop_length = (params.STEP_SIZE / 1000.0) * params.SR
+            X_batch_new = np.zeros((cur_batch_size, params.N_COMPONENTS, int(params.MAX_LENGTH/hop_length)), dtype=theano.config.floatX)
+            y_batch_new = np.zeros_like(X_batch_new)
 
         # Read all images in the batch
         for i in range(len(key_batch_x)):
             #TODO: find MAX_LENGTH
-            X, y = self.process(key_batch_x[i], key_batch_y[i])
-            X_batch[i, :X.shape[0]], y_batch[i, :y.shape[0]] = X[:X_batch.shape[1]], y[:y_batch.shape[1]]
+            if temp:
+                X, y = self.process_temp(key_batch_x[i], key_batch_y[i])
+                X_batch_new[i] = X
+                y_batch_new[i] = y
+            else:
+                X, y = self.process(key_batch_x[i], key_batch_y[i])
+                X_batch[i, :X.shape[0]], y_batch[i, :y.shape[0]] = X[:X_batch.shape[1]], y[:y_batch.shape[1]]
 
         # Transform the batch (augmentation, fft, normalization, etc.)
-        X_batch_new, y_batch_new = self.transform(X_batch, y_batch, sr=params.SR)
+        if not temp:
+            X_batch_new, y_batch_new = self.transform(X_batch, y_batch, sr=params.SR)
 
-        return X_batch_new, y_batch_new
+        return X_batch_new, y_batch_new, key_batch_x
 
     def __iter__(self):
         queue = JoinableQueue(maxsize=params.N_PRODUCERS * 8)
@@ -75,6 +98,15 @@ class ParallelBatchIterator(object):
 
         queue.close()
         job_queue.close()
+        if self.shuffle:
+            shuffled_idx = np.random.permutation(len(self.X))
+            X_new = []
+            y_new = []
+            for i in range(len(self.X)):
+                X_new += [self.X[shuffled_idx[i]]]
+                y_new += [self.y[shuffled_idx[i]]]
+            self.X = X_new
+            self.y = y_new
 
     def start_producers(self, result_queue):
         jobs = Queue()
@@ -124,24 +156,42 @@ class ParallelBatchIterator(object):
 
     def transform(self, Xb, yb, sr):
         n_fft = self.next_greater_power_of_2((params.WINDOW_SIZE/1000.0) * params.SR)
-        hop_length = self.next_greater_power_of_2((params.STEP_SIZE/1000.0) * params.SR)
-        Xb_new = np.zeros((Xb.shape[0], params.N_COMPONENTS, int(np.ceil(Xb.shape[1]/hop_length))+2), dtype=theano.config.floatX)
+        hop_length = int((params.STEP_SIZE / 1000.0) * params.SR)
+        Xb_new = np.zeros((Xb.shape[0], params.N_COMPONENTS, params.MAX_LENGTH/hop_length), dtype=theano.config.floatX)
         yb_new = np.zeros_like(Xb_new)
         #TODO: preprocess and load instead of transforming each time.
         for i in range(Xb.shape[0]):
             if params.MFCC:
-                Xb_new[i, :, :-1] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)
-                yb_new[i, :, :-1] = librosa.feature.mfcc(yb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)
+                Xb_new[i] = librosa.feature.mfcc(Xb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)[:,:-1]
+                yb_new[i] = librosa.feature.mfcc(yb[i], sr, n_mfcc=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length, S=None)[:,:-1]
             else:
-                Xb_new[i, :, :-1] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)
-                yb_new[i, :, :-1] = librosa.feature.melspectrogram(yb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)
+                Xb_new[i] = librosa.feature.melspectrogram(Xb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)[:,:-1]
+                yb_new[i] = librosa.feature.melspectrogram(yb[i], sr, n_mels=params.N_COMPONENTS, n_fft=n_fft, hop_length=hop_length)[:,:-1]
             Xb_new[i] /= np.max(Xb_new[i])+1.e-12
             yb_new[i] /= np.max(yb_new[i])+1.e-12
         return Xb_new, yb_new
 
 
-    def pre_process(self):
-        pass
+    def pre_process(self, path='aurora2/'):
+        for i in range(len(self.X)):
+            print('preprocessing ', i)
+            key_x, key_y = self.X[i], self.y[i]
+            x_raw, y_raw = self.process(key_x, key_y)
+            x = np.zeros((1, params.MAX_LENGTH), dtype=theano.config.floatX)
+            y = np.zeros_like(x)
+            start = 0
+            end = x_raw.shape[0]
+            if x_raw.shape[0] > x.shape[1]:
+                #take middle
+                start = (x_raw.shape[0] - x.shape[1])/2
+                end = start + x.shape[1]
+            x[0, :x_raw.shape[0]] = x_raw[start:end]
+            y[0, :y_raw.shape[0]] = y_raw[start:end]
+            x_new, y_new = self.transform(x, y, params.SR)
+            with open(path + self.dataset + '/'+key_x+'.npy', 'wb') as f:
+                np.save(f, x_new)
+            with open(path + self.dataset + '/'+key_y+'.npy', 'wb') as f:
+                np.save(f, y_new)
 
     def next_greater_power_of_2(self, x):
         return int(2**np.math.ceil(np.math.log(x, 2)))
