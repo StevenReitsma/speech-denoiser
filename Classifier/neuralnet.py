@@ -11,7 +11,7 @@ from tabulate import tabulate
 from collections import OrderedDict
 import sys
 
-from model import build_model, build_model_small, build_model_dense
+from model import build_model_small
 from params import params as par
 from lasagne.layers import DenseLayer, NonlinearityLayer, DropoutLayer
 from lasagne.nonlinearities import softmax, linear
@@ -76,7 +76,7 @@ class PrintLog:
 
 class NeuralNetwork():
 
-    def __init__(self, batch_size, X_train, X_valid, y_train, y_valid, preprocess=False):
+    def __init__(self, batch_size, X_train, X_valid, X_test, preprocess=False):
         self.max_epochs = par.EPOCHS
         self.learning_rate = par.START_LEARNING_RATE
         self.update_learning_rate = theano.shared(np.float32(self.learning_rate))
@@ -84,9 +84,11 @@ class NeuralNetwork():
         self.n_batches = ceil(len(X_train) / float(batch_size))
         self.n_val_batches = ceil(len(X_valid) / float(batch_size))
 
-        self.batch_iterator_train = ParallelBatchIterator(X_train, y_train, batch_size, 'train', shuffle=True, preprocess=preprocess)
-        self.batch_iterator_test = ParallelBatchIterator(X_valid, y_valid, batch_size, 'train', preprocess=preprocess)
-        self.batch_iterator_total = ParallelBatchIterator(X_train+X_valid, y_train+y_valid, batch_size, 'train')
+        self.batch_iterator_train = ParallelBatchIterator(X_train, batch_size, 'train', shuffle=True, preprocess=preprocess)
+        self.batch_iterator_test = ParallelBatchIterator(X_valid, batch_size, 'train', preprocess=preprocess)
+        self.batch_iterator_test_denoised = ParallelBatchIterator(X_valid, batch_size, 'train_denoised')
+        self.batch_iterator_total_noisy = ParallelBatchIterator(X_test, batch_size, 'train')
+        self.batch_iterator_total = ParallelBatchIterator(X_test, batch_size, 'train_denoised')
 
         self.logger = PrintLog()
         self.create_iterator_functions()
@@ -97,13 +99,17 @@ class NeuralNetwork():
     def create_iterator_functions(self):
         # Define input and target variables
         input_var = T.ftensor3('inputs')
-        target_var = T.ftensor3('targets')
+        target_var = T.ivector('targets')
         hop_length = (par.STEP_SIZE / 1000.0) * par.SR
         self.net = build_model_small((None, par.N_COMPONENTS, int(par.MAX_LENGTH/hop_length)), input_var)
 
+        #with open('models/499.pkl', 'rb') as f:
+            #param_values = pickle.load(f)
+            #lasagne.layers.set_all_param_values(self.net['prob'], param_values)
+
         # Define prediction and loss calculation
         prediction = lasagne.layers.get_output(self.net['prob'], inputs=input_var)
-        loss = lasagne.objectives.squared_error(prediction, target_var)
+        loss = lasagne.objectives.categorical_crossentropy(prediction, target_var)
         loss = loss.mean()
 
         # Define updates
@@ -112,7 +118,7 @@ class NeuralNetwork():
 
         # Define test time prediction
         test_prediction = lasagne.layers.get_output(self.net['prob'], inputs=input_var, deterministic=True)
-        test_loss = lasagne.objectives.squared_error(test_prediction, target_var)
+        test_loss = lasagne.objectives.categorical_crossentropy(test_prediction, target_var)
         test_loss = test_loss.mean()
 
         # Compile functions
@@ -125,37 +131,41 @@ class NeuralNetwork():
         train_history = []
         standard_scaler = StandardScaler(copy=False)
         # train standardizer
-        for Xb, yb, filename in tqdm(self.batch_iterator_train, total=self.n_batches):
-            standard_scaler.partial_fit(yb.reshape(Xb.shape[0], -1))
+        for Xb, filename in tqdm(self.batch_iterator_train, total=self.n_batches):
+            standard_scaler.partial_fit(Xb.reshape(Xb.shape[0], -1))
 
         for epoch in range(0, self.max_epochs):
             t0 = time()
 
             train_losses = []
             valid_losses = []
+            valid_accuracy = []
 
-            for Xb, yb, filename in tqdm(self.batch_iterator_train, total=self.n_batches):
+            for Xb, filename in tqdm(self.batch_iterator_train, total=self.n_batches):
                 Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
-                yb = standard_scaler.transform(yb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
                 loss = self.train_fn(Xb, yb)
                 train_losses.append(loss)
 
-            for Xb, yb, filename in tqdm(self.batch_iterator_test, total=self.n_val_batches):
+            for Xb, filename in tqdm(self.batch_iterator_test, total=self.n_val_batches):
                 Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
-                yb = standard_scaler.transform(yb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
                 loss, prediction = self.val_fn(Xb, yb)
+                acc = np.mean(np.argmax(prediction, axis=1)==yb)
+                valid_accuracy.append(acc)
                 valid_losses.append(loss)
 
             # visualize sample
             for j in range(10):
                 plt.clf()
-                plt.imshow(np.concatenate((Xb[j], np.ones((Xb.shape[1], 1)), yb[j], np.ones((Xb.shape[1], 1)), prediction[j]), axis=1), aspect='auto')
+                plt.imshow(Xb[j], aspect='auto')
                 plt.axis('off')
-                plt.title('real/ target/ reconstruction')
+                plt.title('real')
                 plt.savefig('visualizations/' + 'sample_'+str(j)+'.png')
 
             avg_train_loss = np.mean(train_losses)
             avg_valid_loss = np.mean(valid_losses)
+            avg_valid_acc = np.mean(valid_accuracy)
 
 
             if avg_train_loss > best_train_loss * 0.999:
@@ -172,7 +182,7 @@ class NeuralNetwork():
                 'train_loss_best': best_train_loss,
                 'valid_loss': avg_valid_loss,
                 'valid_loss_best': best_valid_loss,
-                'valid_accuracy': 'N/A',
+                'valid_accuracy': avg_valid_acc,
                 'duration': time() - t0,
             }
 
@@ -185,16 +195,56 @@ class NeuralNetwork():
             with open('models/' + str(epoch) + '.pkl', 'wb') as f:
                 pickle.dump(vals, f, -1)
 
-        print('Saving denoised files to disk')
-        for Xb, yb, filename in tqdm(self.batch_iterator_total, total=self.n_batches):
+        print('Calculating validation denoised clean accuracy')
+        #to check how good denoising was of the clean signal!
+        total_acc = 0
+        for Xb, filename in tqdm(self.batch_iterator_test_denoised, total=self.n_batches):
             Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
-            yb = standard_scaler.transform(yb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+            yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
             loss, prediction = self.val_fn(Xb, yb)
-            # untransform before saving
-            prediction = standard_scaler.inverse_transform(prediction.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
-            for j in range(Xb.shape[0]):
-                with open('aurora2/train_denoised' + '/'+filename[j]+'.npy', 'wb') as f:
-                    np.save(f, prediction[j])
+            total_acc += np.sum(yb==np.argmax(prediction, axis=1))
+        print(' Denoised clean accuracy: ', total_acc/float(len(self.batch_iterator_test_denoised.X)))
+
+        print('Calculating final test accuracy')
+        total_acc = 0
+        for Xb, filename in tqdm(self.batch_iterator_total, total=self.n_batches):
+            Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+            yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
+            loss, prediction = self.val_fn(Xb, yb)
+            total_acc += np.sum(yb==np.argmax(prediction, axis=1))
+        print(' Denoised multi accuracy: ', total_acc/float(len(self.batch_iterator_total.X)))
+
+        for j in range(4):
+            total_acc = 0
+            X = [s for s in self.batch_iterator_total.X if ('SNR' + str((j + 1) * 5)) in s]
+            batch_iterator = ParallelBatchIterator(X, par.BATCH_SIZE, 'train_denoised')
+            for Xb, filename in tqdm(batch_iterator, total=self.n_batches):
+                Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
+                loss, prediction = self.val_fn(Xb, yb)
+                total_acc += np.sum(yb == np.argmax(prediction, axis=1))
+            print(' Denoised multi accuracy for '+'SNR' + str((j + 1) * 5)+': ', total_acc / float(len(batch_iterator.X)))
+            print(' Datasize: ', len(X))
+
+        total_acc = 0
+        for Xb, filename in tqdm(self.batch_iterator_total_noisy, total=self.n_batches):
+            Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+            yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
+            loss, prediction = self.val_fn(Xb, yb)
+            total_acc += np.sum(yb==np.argmax(prediction, axis=1))
+        print(' Noisy multi accuracy: ', total_acc/float(len(self.batch_iterator_total_noisy.X)))
+
+        for j in range(4):
+            total_acc = 0
+            X = [s for s in self.batch_iterator_total_noisy.X if ('SNR' + str((j + 1) * 5)) in s]
+            batch_iterator = ParallelBatchIterator(X, par.BATCH_SIZE, 'train')
+            for Xb, filename in tqdm(batch_iterator, total=self.n_batches):
+                Xb = standard_scaler.transform(Xb.reshape(Xb.shape[0], -1)).reshape(Xb.shape)
+                yb = np.array([s[-5] if s[-5] != 'Z' and s[-5] != 'O' else 0 if s[-5] != 'O' else 10 for s in filename]).astype(np.int32)
+                loss, prediction = self.val_fn(Xb, yb)
+                total_acc += np.sum(yb == np.argmax(prediction, axis=1))
+            print(' Noisy multi accuracy for '+'SNR' + str((j + 1) * 5)+': ', total_acc / float(len(batch_iterator.X)))
+            print(' Datasize: ', len(X))
 
     def print_progress(self, train_history):
         self.logger(train_history)
